@@ -13,6 +13,19 @@
 
 namespace rocr::hotswap {
 
+namespace {
+
+bool entry_trampolines_requested() {
+  const char *value = std::getenv("AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES");
+  return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool is_supported_exact_match_passthrough(const char *isa) {
+  return std::strstr(isa, "gfx1250") != nullptr;
+}
+
+} // namespace
+
 int RetargetCodeObject(const void *elf_data, size_t elf_size,
                        const char *source_isa, const char *target_isa,
                        void **out_data, size_t *out_size) {
@@ -31,6 +44,20 @@ int RetargetCodeObject(const void *elf_data, size_t elf_size,
     return -1;
   }
 
+  if (std::strcmp(source_isa, target_isa) == 0 &&
+      is_supported_exact_match_passthrough(source_isa) &&
+      !entry_trampolines_requested()) {
+    void *output_buf = std::malloc(elf_size);
+    if (!output_buf) {
+      fprintf(stderr, "hotswap: failed to allocate passthrough buffer\n");
+      return -1;
+    }
+    std::memcpy(output_buf, elf_data, elf_size);
+    *out_data = output_buf;
+    *out_size = elf_size;
+    return 0;
+  }
+
   // Wrap input bytes in a COMGR data object.
   amd_comgr_data_t input = {0};
   amd_comgr_status_t status =
@@ -40,7 +67,8 @@ int RetargetCodeObject(const void *elf_data, size_t elf_size,
     return static_cast<int>(status);
   }
 
-  status = amd_comgr_set_data(input, elf_size, static_cast<const char *>(elf_data));
+  status =
+      amd_comgr_set_data(input, elf_size, static_cast<const char *>(elf_data));
   if (status != AMD_COMGR_STATUS_SUCCESS) {
     fprintf(stderr, "hotswap: failed to set COMGR input data\n");
     amd_comgr_release_data(input);
@@ -79,8 +107,8 @@ int RetargetCodeObject(const void *elf_data, size_t elf_size,
     return -1;
   }
 
-  status = amd_comgr_get_data(output, &output_size,
-                              static_cast<char *>(output_buf));
+  status =
+      amd_comgr_get_data(output, &output_size, static_cast<char *>(output_buf));
   amd_comgr_release_data(output);
 
   if (status != AMD_COMGR_STATUS_SUCCESS) {

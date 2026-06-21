@@ -26,16 +26,16 @@
 #include <hsa.h>
 #include <hsa_api_trace.h>
 #include <hsa_ext_amd.h>
+#include <limits>
 #include <memory>
 #include <mutex>
-#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 // The agent's gfx target and ASIC revision are read through the HSA runtime
 // (HSA_AMD_AGENT_INFO_ASIC_REVISION) in hotswap_gfx_query.{hpp,cpp}, which is
-// portable across Linux and Windows. 
+// portable across Linux and Windows.
 
 #define HSA_HOTSWAP_EXPORT __attribute__((visibility("default")))
 
@@ -43,8 +43,11 @@ namespace {
 
 namespace hotswap_io = rocr::hotswap::platform_io;
 
+using rocr::hotswap::add_gfx1250_stepping_feature;
 using rocr::hotswap::AgentGfxRevision;
+using rocr::hotswap::extract_gfx_target;
 using rocr::hotswap::gate_allows_hotswap;
+using rocr::hotswap::gate_allows_hotswap_rewrite;
 using rocr::hotswap::get_agent_isa_name;
 using rocr::hotswap::query_agent_gfx_revision;
 
@@ -71,8 +74,9 @@ CoreApiTable *g_core_table = nullptr;
 
 decltype(hsa_code_object_reader_create_from_memory)
     *g_orig_reader_create_from_memory = nullptr;
-decltype(hsa_code_object_reader_create_from_file)
-    *g_orig_reader_create_from_file = nullptr;
+decltype(
+    hsa_code_object_reader_create_from_file) *g_orig_reader_create_from_file =
+    nullptr;
 decltype(hsa_code_object_reader_destroy) *g_orig_reader_destroy = nullptr;
 decltype(hsa_executable_load_agent_code_object) *g_orig_load_agent_code_object =
     nullptr;
@@ -97,6 +101,11 @@ bool checked_mul(size_t lhs, size_t rhs, size_t *out) {
   }
   *out = lhs * rhs;
   return true;
+}
+
+bool entry_trampolines_requested() {
+  const char *value = std::getenv("AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES");
+  return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
 bool try_get_reader_entry(uint64_t handle, ByteVec *bytes, bool *from_file) {
@@ -153,8 +162,7 @@ bool compute_program_header_offset(const Elf64_Ehdr *ehdr, size_t size,
                                    uint16_t index, size_t *hdr_offset) {
   size_t hdr_index_offset = 0;
   if (!checked_mul(static_cast<size_t>(index),
-                   static_cast<size_t>(ehdr->e_phentsize),
-                   &hdr_index_offset) ||
+                   static_cast<size_t>(ehdr->e_phentsize), &hdr_index_offset) ||
       !checked_add(ehdr->e_phoff, hdr_index_offset, hdr_offset) ||
       *hdr_offset > size || sizeof(Elf64_Phdr) > size - *hdr_offset) {
     return false;
@@ -207,7 +215,8 @@ std::string find_isa_in_metadata(const char *desc, size_t desc_size) {
   return {};
 }
 
-std::string read_elf_isa_from_note_segment(const uint8_t *elf, size_t note_offset,
+std::string read_elf_isa_from_note_segment(const uint8_t *elf,
+                                           size_t note_offset,
                                            size_t note_end) {
   while (note_offset <= note_end &&
          sizeof(Elf64_Nhdr) <= note_end - note_offset) {
@@ -247,8 +256,7 @@ std::string read_elf_isa_note(const uint8_t *elf, size_t size) {
     if (!compute_program_header_offset(ehdr, size, i, &hdr_offset)) {
       break;
     }
-    const auto *phdr =
-        reinterpret_cast<const Elf64_Phdr *>(elf + hdr_offset);
+    const auto *phdr = reinterpret_cast<const Elf64_Phdr *>(elf + hdr_offset);
     if (phdr->p_type != PT_NOTE) {
       continue;
     }
@@ -259,8 +267,8 @@ std::string read_elf_isa_note(const uint8_t *elf, size_t size) {
       continue;
     }
 
-    std::string result = read_elf_isa_from_note_segment(elf, note_offset,
-                                                        note_end);
+    std::string result =
+        read_elf_isa_from_note_segment(elf, note_offset, note_end);
     if (!result.empty()) {
       return result;
     }
@@ -341,7 +349,8 @@ hotswap_reader_destroy(hsa_code_object_reader_t code_object_reader) {
   return g_orig_reader_destroy(code_object_reader);
 }
 
-hsa_status_t load_original_reader(hsa_executable_t executable, hsa_agent_t agent,
+hsa_status_t load_original_reader(hsa_executable_t executable,
+                                  hsa_agent_t agent,
                                   hsa_code_object_reader_t code_object_reader,
                                   const char *options,
                                   hsa_loaded_code_object_t *loaded_code_object,
@@ -354,14 +363,14 @@ hsa_status_t load_original_reader(hsa_executable_t executable, hsa_agent_t agent
   return status;
 }
 
-hsa_status_t load_rewritten_reader(hsa_executable_t executable, hsa_agent_t agent,
-                                   const char *options,
+hsa_status_t load_rewritten_reader(hsa_executable_t executable,
+                                   hsa_agent_t agent, const char *options,
                                    hsa_loaded_code_object_t *loaded_code_object,
                                    void *out_elf, size_t out_elf_size) {
   OwnedElf owned_elf(out_elf, &std::free);
   hsa_code_object_reader_t new_reader = {};
-  hsa_status_t status =
-      g_orig_reader_create_from_memory(owned_elf.get(), out_elf_size, &new_reader);
+  hsa_status_t status = g_orig_reader_create_from_memory(
+      owned_elf.get(), out_elf_size, &new_reader);
   if (status != HSA_STATUS_SUCCESS) {
     return status;
   }
@@ -379,17 +388,26 @@ hsa_status_t load_rewritten_reader(hsa_executable_t executable, hsa_agent_t agen
   return status;
 }
 
-hsa_status_t try_retarget_and_load(hsa_executable_t executable, hsa_agent_t agent,
+hsa_status_t try_retarget_and_load(hsa_executable_t executable,
+                                   hsa_agent_t agent,
                                    hsa_code_object_reader_t code_object_reader,
                                    const char *options,
                                    hsa_loaded_code_object_t *loaded_code_object,
-                                   const ByteVec &local_bytes) {
-  const std::string source_isa =
+                                   const ByteVec &local_bytes,
+                                   const AgentGfxRevision &gfx) {
+  std::string source_isa =
       read_elf_isa_note(local_bytes->data(), local_bytes->size());
-  const std::string target_isa = get_agent_isa_name(agent);
+  std::string target_isa = get_agent_isa_name(agent);
 
   if (source_isa.empty() || target_isa.empty()) {
     return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+  }
+
+  if (extract_gfx_target(source_isa) == "gfx1250" &&
+      extract_gfx_target(target_isa) == "gfx1250") {
+    source_isa = add_gfx1250_stepping_feature(source_isa, true);
+    target_isa =
+        add_gfx1250_stepping_feature(target_isa, !gate_allows_hotswap(gfx));
   }
 
   // Route through RetargetCodeObject for unified logging, validation,
@@ -430,18 +448,16 @@ hsa_status_t HSA_API hotswap_load_agent_code_object(
                                   reader_from_file);
     }
 
-    // Gate HotSwap to gfx1250 A0 silicon. On any other GPU or stepping, load
-    // the original code object unchanged instead of routing through COMGR.
     const AgentGfxRevision gfx = query_agent_gfx_revision(agent);
-    if (!gate_allows_hotswap(gfx)) {
+    if (!gate_allows_hotswap_rewrite(gfx, entry_trampolines_requested())) {
       return load_original_reader(executable, agent, code_object_reader,
                                   options, loaded_code_object,
                                   reader_from_file);
     }
 
-    const hsa_status_t status = try_retarget_and_load(
-        executable, agent, code_object_reader, options, loaded_code_object,
-        local_bytes);
+    const hsa_status_t status =
+        try_retarget_and_load(executable, agent, code_object_reader, options,
+                              loaded_code_object, local_bytes, gfx);
     if (status == HSA_STATUS_SUCCESS) {
       return status;
     }
