@@ -295,10 +295,13 @@ std::optional<RewriteDecision> DecideHotswapRewrite(
   const std::string target_gfx = ExtractGfxTarget(target_isa);
   if (IsHotswapSupportedGfxRevision(gfx) && source_gfx == kGfx1250 &&
       target_gfx == kGfx1250) {
+    // B0->A0 retarget always uses the legacy (non entry-trampoline) rewrite
+    // path, independent of the entry-trampoline default, matching upstream
+    // develop behavior.
     return RewriteDecision{
         WithGfx1250SteppingFeature(source_isa, Gfx1250Stepping::kB0),
         WithGfx1250SteppingFeature(target_isa, Gfx1250Stepping::kA0),
-        options.gfx12_5_rewrite_enabled};
+        false};
   }
 
   if (!options.gfx12_5_rewrite_enabled ||
