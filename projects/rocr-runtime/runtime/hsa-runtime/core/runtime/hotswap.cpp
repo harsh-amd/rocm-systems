@@ -69,6 +69,37 @@ namespace {
 std::mutex g_retained_rewritten_elf_buffers_mutex;
 std::unordered_map<uint64_t, std::vector<OwnedElfBuffer>> g_retained_rewritten_elf_buffers;
 
+uint64_t FnvHash(const void* data, size_t size) {
+  constexpr uint64_t kFnvOffset = 14695981039346656037ULL;
+  constexpr uint64_t kFnvPrime = 1099511628211ULL;
+  uint64_t hash = kFnvOffset;
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= kFnvPrime;
+  }
+  return hash;
+}
+
+uint64_t ComputeRetargetCacheKey(const void* elf_data, size_t elf_size,
+                                 const std::string& source_isa,
+                                 const std::string& target_isa,
+                                 bool entry_trampolines) {
+  uint64_t hash = FnvHash(elf_data, elf_size);
+  hash ^= FnvHash(source_isa.data(), source_isa.size()) * 31;
+  hash ^= FnvHash(target_isa.data(), target_isa.size()) * 37;
+  hash ^= entry_trampolines ? 0x1ULL : 0x0ULL;
+  return hash;
+}
+
+struct CachedRetargetResult {
+  bool succeeded = false;
+  std::vector<uint8_t> elf_bytes;
+};
+
+std::mutex g_retarget_cache_mutex;
+std::unordered_map<uint64_t, CachedRetargetResult> g_retarget_cache;
+
 constexpr char kGfx1250[] = "gfx1250";
 constexpr char kGfx1250B0Feature[] = ":gfx1250-b0-specific+";
 constexpr char kGfx1250A0Feature[] = ":gfx1250-b0-specific-";
@@ -456,11 +487,55 @@ bool TryRetargetCodeObject(const CodeObjectView& code_object, hsa_agent_t agent,
     return false;
   }
 
+  const uint64_t cache_key = ComputeRetargetCacheKey(
+      code_object.data, code_object.size, decision->source_isa,
+      decision->target_isa, decision->request_entry_trampolines);
+
+  {
+    std::scoped_lock lock(g_retarget_cache_mutex);
+    auto it = g_retarget_cache.find(cache_key);
+    if (it != g_retarget_cache.end()) {
+      const CachedRetargetResult& cached = it->second;
+      if (cached.succeeded) {
+        OwnedElfBuffer buf(std::malloc(cached.elf_bytes.size()), &std::free);
+        if (buf) {
+          std::memcpy(buf.get(), cached.elf_bytes.data(), cached.elf_bytes.size());
+          *out_elf_buffer = std::move(buf);
+          *out_elf_size = cached.elf_bytes.size();
+          HOTSWAP_LOG("hotswap: cache hit (success) src=%s tgt=%s entry_trampolines=%d "
+                      "in=%zu out=%zu\n",
+                      decision->source_isa.c_str(), decision->target_isa.c_str(),
+                      decision->request_entry_trampolines, code_object.size,
+                      cached.elf_bytes.size());
+          return true;
+        }
+      } else {
+        HOTSWAP_LOG("hotswap: cache hit (failed) src=%s tgt=%s entry_trampolines=%d "
+                    "in=%zu\n",
+                    decision->source_isa.c_str(), decision->target_isa.c_str(),
+                    decision->request_entry_trampolines, code_object.size);
+        return false;
+      }
+    }
+  }
+
   const bool rewritten =
       RetargetCodeObject(code_object.data, code_object.size,
                          decision->source_isa.c_str(), decision->target_isa.c_str(),
                          out_elf_buffer, out_elf_size,
                          decision->request_entry_trampolines);
+
+  {
+    std::scoped_lock lock(g_retarget_cache_mutex);
+    CachedRetargetResult entry;
+    entry.succeeded = rewritten;
+    if (rewritten) {
+      const auto* data = static_cast<const uint8_t*>((*out_elf_buffer).get());
+      entry.elf_bytes.assign(data, data + *out_elf_size);
+    }
+    g_retarget_cache.emplace(cache_key, std::move(entry));
+  }
+
   HOTSWAP_LOG("hotswap: rewrite src=%s tgt=%s entry_trampolines=%d in=%zu out=%zu changed=%d\n",
               decision->source_isa.c_str(), decision->target_isa.c_str(),
               decision->request_entry_trampolines, code_object.size,
